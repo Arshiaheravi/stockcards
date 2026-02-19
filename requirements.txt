@@ -1,0 +1,127 @@
+"""
+Market mood (Fear & Greed) service.
+
+Fetches sentiment data from:
+- CNN Fear & Greed Index (stocks) — with VIX fallback
+- Alternative.me (crypto)
+"""
+
+import logging
+
+import requests
+import yfinance as yf
+
+from stockcards.models.signals import DualMarketMood, MarketMood
+
+logger = logging.getLogger(__name__)
+
+
+def _mood_label(value: int) -> str:
+    """Convert 0-100 score to human label."""
+    if value <= 25:
+        return "Extreme Fear"
+    if value <= 45:
+        return "Fear"
+    if value <= 55:
+        return "Neutral"
+    if value <= 75:
+        return "Greed"
+    return "Extreme Greed"
+
+
+def _mood_recommendation(value: int, market_type: str) -> str:
+    """Action suggestion based on fear/greed value."""
+    if value <= 25:
+        return f"Great time for {market_type} — maximum fear = maximum opportunity"
+    if value <= 45:
+        return f"Good time for {market_type} — others are scared"
+    if value <= 55:
+        return f"{market_type.title()} balanced — be selective"
+    if value <= 75:
+        return f"Be cautious with {market_type} — getting greedy"
+    return f"High risk in {market_type} — consider taking profits"
+
+
+def get_stock_fear_greed() -> MarketMood:
+    """Fetch CNN Fear & Greed Index, fall back to VIX if it fails."""
+    # Try CNN API with updated headers
+    for url in [
+        "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
+        "https://production.dataviz.cnn.io/index/fearandgreed/current",
+    ]:
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "Accept": "application/json",
+                "Referer": "https://edition.cnn.com/markets/fear-and-greed",
+            }
+            r = requests.get(url, headers=headers, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            # Handle both response formats
+            score = data.get("fear_and_greed", data)
+            value = int(score["score"] if isinstance(score, dict) else score)
+
+            return MarketMood(
+                value=value,
+                label=_mood_label(value),
+                recommendation=_mood_recommendation(value, "stocks"),
+                source="CNN Fear & Greed",
+            )
+        except Exception as e:
+            logger.warning("CNN Fear/Greed failed (%s): %s", url.split("/")[-1], e)
+
+    # VIX fallback — convert VIX level to a 0-100 fear/greed scale
+    try:
+        vix = yf.Ticker("^VIX")
+        vix_data = vix.history(period="5d")
+        if not vix_data.empty:
+            vix_value = float(vix_data["Close"].values[-1])
+            # VIX 10 = extreme greed (95), VIX 35 = extreme fear (5)
+            value = max(5, min(95, int(100 - (vix_value - 10) * 3.6)))
+            return MarketMood(
+                value=value,
+                label=f"{_mood_label(value)} (VIX: {vix_value:.1f})",
+                recommendation=_mood_recommendation(value, "stocks"),
+                source="VIX Index",
+            )
+    except Exception as e:
+        logger.error("VIX fallback also failed: %s", e)
+
+    return MarketMood(
+        value=50,
+        label="Neutral",
+        recommendation="Stock mood unavailable",
+        source="N/A",
+    )
+
+
+def get_crypto_fear_greed() -> MarketMood:
+    """Fetch Alternative.me crypto Fear & Greed Index."""
+    try:
+        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
+        r.raise_for_status()
+        value = int(r.json()["data"][0]["value"])
+
+        return MarketMood(
+            value=value,
+            label=_mood_label(value),
+            recommendation=_mood_recommendation(value, "crypto"),
+            source="Alternative.me",
+        )
+    except Exception as e:
+        logger.warning("Crypto Fear/Greed failed: %s", e)
+        return MarketMood(
+            value=50,
+            label="Neutral",
+            recommendation="Crypto mood unavailable",
+            source="N/A",
+        )
+
+
+def get_dual_market_mood() -> DualMarketMood:
+    """Get both stock and crypto fear/greed in one call."""
+    return DualMarketMood(
+        stocks=get_stock_fear_greed(),
+        crypto=get_crypto_fear_greed(),
+    )

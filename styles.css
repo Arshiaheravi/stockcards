@@ -1,0 +1,582 @@
+/* ═══════════════════════════════════════════════════════════
+   STOCKCARDS — Frontend Application
+   Connects to FastAPI backend on localhost:8000
+   ═══════════════════════════════════════════════════════════ */
+
+const API = 'http://localhost:8000';
+const stockCache = {};   // ticker -> stock data
+let allStocks = [];      // full dashboard results
+
+// ── INIT ──────────────────────────────────────────────────
+
+document.addEventListener('DOMContentLoaded', () => {
+    initNavigation();
+    initFilters();
+    initWatchlist();
+    initChat();
+    loadDashboard();
+    loadLearnContent();
+    updateXP();
+});
+
+// ── NAVIGATION ────────────────────────────────────────────
+
+function initNavigation() {
+    document.querySelectorAll('.nav-link').forEach(link => {
+        link.addEventListener('click', e => {
+            e.preventDefault();
+            navigateTo(link.dataset.page);
+        });
+    });
+}
+
+function navigateTo(page) {
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+    const target = document.getElementById(`page-${page}`);
+    if (target) target.classList.add('active');
+    const link = document.querySelector(`.nav-link[data-page="${page}"]`);
+    if (link) link.classList.add('active');
+    if (page === 'news') loadNews();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+// ── DASHBOARD ─────────────────────────────────────────────
+
+async function loadDashboard() {
+    try {
+        const res = await fetch(`${API}/api/dashboard`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+
+        // Mood
+        const mood = data.market_mood || data.marketMood || {};
+        if (mood.stocks) updateMood(mood.stocks);
+
+        // Stocks
+        allStocks = data.stocks || [];
+        allStocks.forEach(s => { stockCache[s.ticker.toLowerCase()] = s; });
+        renderSignals(allStocks);
+        hide('loading-signals');
+
+    } catch (err) {
+        console.error('Dashboard load failed:', err);
+        hide('loading-signals');
+        document.getElementById('signals-container').innerHTML =
+            '<p style="color:var(--text-muted);padding:40px;text-align:center">Could not connect to backend. Make sure <code>uvicorn</code> is running on port 8000.</p>';
+    }
+}
+
+// ── MOOD ──────────────────────────────────────────────────
+
+function updateMood(mood) {
+    const val = mood.value || 50;
+    document.getElementById('mood-value').textContent = val;
+    document.getElementById('mood-label').textContent = mood.label || 'Neutral';
+    document.getElementById('mood-source').textContent = mood.source || '';
+    document.getElementById('mood-fill').style.width = `${val}%`;
+    document.getElementById('mood-rec').textContent = mood.recommendation || '';
+
+    const el = document.getElementById('mood-value');
+    if (val <= 25) el.style.color = 'var(--red)';
+    else if (val <= 45) el.style.color = 'var(--orange)';
+    else if (val <= 55) el.style.color = 'var(--yellow)';
+    else if (val <= 75) el.style.color = 'var(--green)';
+    else el.style.color = '#22c55e';
+}
+
+// ── SIGNAL CARDS ──────────────────────────────────────────
+
+function renderSignals(stocks, filter = 'all') {
+    const container = document.getElementById('signals-container');
+    let filtered;
+    
+    if (filter === 'all') {
+        // Default: hide WAIT and AVOID — show the good stuff
+        filtered = stocks.filter(s => !['WAIT', 'AVOID'].includes(s.signal));
+        if (!filtered.length) filtered = stocks; // Fallback if nothing actionable
+    } else {
+        filtered = stocks.filter(s => s.signal === filter);
+    }
+
+    // Update count
+    const countEl = document.getElementById('signal-count');
+    if (countEl) countEl.textContent = `${filtered.length} of ${stocks.length} stocks`;
+
+    if (!filtered.length) {
+        container.innerHTML = '<p style="color:var(--text-muted);padding:40px">No signals match this filter.</p>';
+        return;
+    }
+    container.innerHTML = filtered.map(renderCard).join('');
+}
+
+function renderCard(s) {
+    const tier = getTier(s.confidence);
+    const sig = getSignalStyle(s.signal);
+    const ath = s.distance_from_ath ?? s.distanceFromATH ?? 0;
+    const stop = s.stop_loss ?? s.stopLoss ?? 0;
+    const volSurge = s.volume_surge ?? s.volumeSurge ?? false;
+    const athClass = ath <= 10 ? 'positive' : ath <= 25 ? 'warning' : 'negative';
+    const vol = volSurge ? { label: 'High', cls: 'positive' } : { label: 'Normal', cls: 'neutral' };
+    const chartColor = (s.signal === 'BREAKOUT' || s.signal === 'BUY' || s.signal === 'READY') ? '%2322c55e' : (s.signal === 'WATCH' || s.signal === 'WAIT') ? '%23eab308' : '%23ef4444';
+
+    return `
+    <div class="stock-card ${tier}" onclick="openModal('${s.ticker}')">
+        <div class="card-inner"><div class="card-content">
+            <div class="card-top-bar">
+                <span class="tier-badge">${tierLabel(tier)}</span>
+                <span class="signal-badge ${sig.cls}"><span class="signal-dot"></span>${sig.label}</span>
+            </div>
+            <div class="card-chart">
+                <iframe scrolling="no" allowtransparency="true" frameborder="0"
+                    src="https://s.tradingview.com/embed-widget/mini-symbol-overview/?locale=en&symbol=${s.ticker}&dateRange=6M&colorTheme=dark&isTransparent=true&autosize=true&trendLineColor=${chartColor}&underLineColor=rgba%2834%2C197%2C94%2C0.15%29"></iframe>
+            </div>
+            <div class="card-bottom">
+                <div class="stats-grid">
+                    <div class="stat"><div class="stat-label">ATH</div><div class="stat-value ${athClass}">-${ath}%</div></div>
+                    <div class="stat"><div class="stat-label">Stop</div><div class="stat-value">$${num(stop)}</div></div>
+                    <div class="stat"><div class="stat-label">Volume</div><div class="stat-value ${vol.cls}">${vol.label}</div></div>
+                </div>
+                <div class="rating-section">
+                    <div class="rating-header"><span class="rating-label">Rating</span><span class="rating-value">${s.confidence}</span></div>
+                    <div class="rating-bar"><div class="rating-fill" style="width:${s.confidence}%"></div></div>
+                </div>
+            </div>
+        </div></div>
+    </div>`;
+}
+
+// ── FILTERS ───────────────────────────────────────────────
+
+function initFilters() {
+    document.getElementById('signal-filters')?.addEventListener('click', e => {
+        const pill = e.target.closest('.pill');
+        if (!pill) return;
+        document.querySelectorAll('#signal-filters .pill').forEach(p => p.classList.remove('active'));
+        pill.classList.add('active');
+        renderSignals(allStocks, pill.dataset.filter);
+    });
+}
+
+// ── MODAL ─────────────────────────────────────────────────
+
+function openModal(ticker) {
+    const s = stockCache[ticker.toLowerCase()];
+    if (!s) return;
+
+    const tier = getTier(s.confidence);
+    const sig = getSignalStyle(s.signal);
+    const card = document.getElementById('modal-card');
+    card.className = `modal-card ${tier}`;
+
+    setText('modal-tier', tierLabel(tier));
+    const sigBadge = document.getElementById('modal-signal');
+    sigBadge.className = `signal-badge ${sig.cls}`;
+    setText('modal-signal-text', sig.label);
+    setText('modal-ticker', s.ticker);
+    setText('modal-company', (s.name || '').toUpperCase());
+    setText('modal-explanation', s.explanation || 'Analysis in progress...');
+
+    // Technicals
+    const rsi = s.rsi ?? 50;
+    const rs = s.relative_strength ?? s.relativeStrength ?? 1.0;
+    const hasFlag = s.has_flag ?? s.hasFlag ?? false;
+    const poleMove = s.pole_move ?? s.poleMove ?? 0;
+    const flagRange = s.flag_range ?? s.flagRange ?? 0;
+    const ath = s.distance_from_ath ?? s.distanceFromATH ?? 0;
+    const stop = s.stop_loss ?? s.stopLoss ?? 0;
+    const volSurge = s.volume_surge ?? s.volumeSurge ?? false;
+
+    setText('modal-rsi', rsi);
+    setColor('modal-rsi', rsi <= 55 ? 'positive' : rsi <= 65 ? '' : 'negative');
+    setText('modal-rs', `${rs}x`);
+    setColor('modal-rs', rs >= 1.1 ? 'positive' : rs < 0.9 ? 'negative' : '');
+    setText('modal-uptrend', s.uptrend ? 'Yes' : 'No');
+    setColor('modal-uptrend', s.uptrend ? 'positive' : 'negative');
+
+    // Pattern
+    setText('modal-flag', hasFlag ? 'Detected' : 'None');
+    setColor('modal-flag', hasFlag ? 'positive' : '');
+    setText('modal-pole', `${poleMove}%`);
+    setText('modal-range', `${flagRange}%`);
+
+    // Chart
+    document.getElementById('modal-chart').src = `https://s.tradingview.com/embed-widget/advanced-chart/?locale=en&symbol=${s.ticker}&interval=D&timezone=America%2FNew_York&theme=dark&style=1&hide_top_toolbar=false&hide_legend=false&save_image=false&hide_volume=false`;
+
+    // Footer
+    const athClass = ath <= 10 ? 'positive' : ath <= 25 ? 'warning' : 'negative';
+    const vol = volSurge ? { label: 'High', cls: 'positive' } : { label: 'Normal', cls: '' };
+    setText('modal-ath', `-${ath}%`);
+    setColor('modal-ath', athClass);
+    setText('modal-stop', `$${num(stop)}`);
+    setText('modal-vol', vol.label);
+    setColor('modal-vol', vol.cls);
+    setText('modal-risk', s.risk || '--');
+    document.getElementById('modal-rating-bar').style.width = `${s.confidence}%`;
+    setText('modal-rating', s.confidence);
+
+    document.getElementById('modal-overlay').classList.add('active');
+    document.body.style.overflow = 'hidden';
+}
+
+function closeModal(e) {
+    if (e) e.stopPropagation();
+    document.getElementById('modal-overlay').classList.remove('active');
+    document.body.style.overflow = '';
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+// ── NEWS ──────────────────────────────────────────────────
+
+async function loadNews() {
+    try {
+        const res = await fetch(`${API}/api/news`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const news = await res.json();
+        renderNews(news);
+        hide('loading-news');
+    } catch (err) {
+        console.error('News load failed:', err);
+        hide('loading-news');
+        document.getElementById('news-container').innerHTML =
+            '<p style="color:var(--text-muted);padding:40px">Could not load news.</p>';
+    }
+}
+
+function renderNews(items) {
+    const container = document.getElementById('news-container');
+    if (!items.length) { container.innerHTML = '<p style="color:var(--text-muted)">No news available.</p>'; return; }
+
+    container.innerHTML = items.map(n => `
+        <div class="news-card">
+            <a href="${n.link}" target="_blank" rel="noopener">
+                <div class="news-source">${esc(n.source)} · ${esc(n.date)}</div>
+                <div class="news-title">${esc(n.title)}</div>
+                <div class="news-summary">${esc(n.summary)}</div>
+                ${(n.related_tickers || n.relatedTickers || []).length ? `<div class="news-tickers">${(n.related_tickers || n.relatedTickers).map(t => `<span class="news-ticker-tag">$${t}</span>`).join('')}</div>` : ''}
+            </a>
+        </div>
+    `).join('');
+}
+
+// ── WATCHLIST ─────────────────────────────────────────────
+
+function getWatchlist() {
+    try { return JSON.parse(localStorage.getItem('sc_watchlist') || '[]'); } catch { return []; }
+}
+function saveWatchlist(list) { localStorage.setItem('sc_watchlist', JSON.stringify(list)); }
+
+function initWatchlist() {
+    renderWatchlist();
+    document.getElementById('add-watchlist')?.addEventListener('click', () => {
+        const ticker = prompt('Enter ticker symbol (e.g. AAPL):');
+        if (!ticker) return;
+        const list = getWatchlist();
+        const clean = ticker.trim().toUpperCase();
+        if (!list.includes(clean)) { list.push(clean); saveWatchlist(list); }
+        renderWatchlist();
+    });
+}
+
+function renderWatchlist() {
+    const container = document.getElementById('watchlist-items');
+    const list = getWatchlist();
+    if (!list.length) { container.innerHTML = '<p style="color:var(--text-dim);font-size:0.8rem">No tickers yet. Click + to add.</p>'; return; }
+
+    container.innerHTML = list.map(t => `
+        <div class="watchlist-item">
+            <span class="watchlist-ticker">${t}</span>
+            <button class="watchlist-remove" onclick="removeWatchlist('${t}')">✕</button>
+        </div>
+    `).join('');
+}
+
+function removeWatchlist(ticker) {
+    const list = getWatchlist().filter(t => t !== ticker);
+    saveWatchlist(list);
+    renderWatchlist();
+}
+
+// ── CHAT ──────────────────────────────────────────────────
+
+function initChat() {
+    document.getElementById('chat-input')?.addEventListener('keydown', e => {
+        if (e.key === 'Enter') sendChat();
+    });
+}
+
+function toggleChat() {
+    document.getElementById('chat-panel').classList.toggle('open');
+}
+
+async function sendChat() {
+    const input = document.getElementById('chat-input');
+    const msg = input.value.trim();
+    if (!msg) return;
+    input.value = '';
+
+    appendChat('user', msg);
+    appendChat('assistant', '<span class="spinner" style="width:16px;height:16px;display:inline-block;border-width:2px"></span>');
+
+    try {
+        const res = await fetch(`${API}/api/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message: msg, lang: 'en' })
+        });
+        const data = await res.json();
+        removeLastChat();
+        appendChat('assistant', data.response || 'Sorry, I couldn\'t process that.');
+    } catch {
+        removeLastChat();
+        appendChat('assistant', 'Connection error. Make sure the backend is running.');
+    }
+}
+
+function appendChat(role, html) {
+    const container = document.getElementById('chat-messages');
+    const div = document.createElement('div');
+    div.className = `chat-msg ${role}`;
+    div.innerHTML = `<p>${html}</p>`;
+    container.appendChild(div);
+    container.scrollTop = container.scrollHeight;
+}
+
+function removeLastChat() {
+    const container = document.getElementById('chat-messages');
+    const last = container.lastElementChild;
+    if (last) container.removeChild(last);
+}
+
+// ── LEARN ─────────────────────────────────────────────────
+
+const LEARN_DATA = [
+    {
+        id: 'basics', title: 'Trading Basics', lessons: [
+            { id: 'what-is-trading', title: 'What is Trading?', xp: 50,
+              content: `<p>Trading means buying and selling financial assets — stocks, ETFs, crypto — to profit from price changes.</p>
+              <p><strong>Investing vs Trading:</strong> Investing is buying and holding for years. Trading is shorter — days to weeks — capitalizing on momentum and patterns.</p>
+              <p>With StockCards, we focus on <strong>swing trading</strong>: holding positions for 1-4 weeks, catching the "sweet spot" of a move without staring at screens all day.</p>` },
+            { id: 'how-much-start', title: 'How Much Do I Need to Start?', xp: 50,
+              content: `<p>You can start with as little as <strong>$500 CAD</strong>. Many Canadian brokers like Questrade or Wealthsimple have $0 minimum.</p>
+              <p><strong>The real question is position sizing.</strong> With a $1,000 account, you'd risk 2% per trade ($20). That's your safety net.</p>
+              <p>Pro tip: start with a TFSA (Tax-Free Savings Account) — all your gains are tax-free in Canada.</p>` },
+            { id: 'what-to-invest', title: 'Stocks, ETFs, and Crypto', xp: 75,
+              content: `<p><strong>Stocks</strong> — ownership in a single company (AAPL, NVDA).</p>
+              <p><strong>ETFs</strong> — baskets of stocks. SPY tracks the S&P 500. Less risk, less reward.</p>
+              <p><strong>Crypto</strong> — digital assets (BTC, ETH). Higher volatility, 24/7 markets.</p>
+              <p>StockCards focuses on <strong>stocks near all-time highs</strong> — the strongest companies showing institutional buying.</p>` },
+            { id: 'first-trade', title: 'Your First Trade (Step by Step)', xp: 100,
+              content: `<p><strong>Step 1:</strong> Open a brokerage account (Questrade, IBKR, or Wealthsimple).</p>
+              <p><strong>Step 2:</strong> Fund it with your starting amount.</p>
+              <p><strong>Step 3:</strong> Check StockCards for BUY or BREAKOUT signals.</p>
+              <p><strong>Step 4:</strong> Set your stop loss (the card shows you where).</p>
+              <p><strong>Step 5:</strong> Calculate position size: Risk $ ÷ (Entry - Stop) = Shares.</p>
+              <p><strong>Step 6:</strong> Place the trade and set a trailing stop.</p>` }
+        ]
+    },
+    {
+        id: 'indicators', title: 'Understanding Indicators', lessons: [
+            { id: 'rsi', title: 'RSI — Is It Overbought?', xp: 50,
+              content: `<p><strong>RSI (Relative Strength Index)</strong> measures how fast price is moving on a scale of 0-100.</p>
+              <p><strong>Under 30:</strong> Oversold — possible bounce coming.</p>
+              <p><strong>50-55:</strong> Sweet spot for entries — not overbought, still has room.</p>
+              <p><strong>Over 65:</strong> Getting hot — wait for a pullback.</p>
+              <p>StockCards prefers entries when RSI is 50-55. This gives maximum upside with minimum risk of buying the top.</p>` },
+            { id: 'relative-strength', title: 'Relative Strength vs S&P 500', xp: 75,
+              content: `<p>Relative Strength compares a stock's performance to the overall market (S&P 500).</p>
+              <p><strong>RS > 1.0:</strong> Outperforming the market. Good.</p>
+              <p><strong>RS > 1.3:</strong> Significantly outperforming. These are market leaders.</p>
+              <p><strong>RS < 0.9:</strong> Lagging. Even if the chart looks ok, smart money is elsewhere.</p>
+              <p>This is how institutions pick stocks — they want leaders, not laggards.</p>` },
+            { id: 'volume', title: 'Volume — Follow the Money', xp: 50,
+              content: `<p>Volume tells you <strong>how many shares traded</strong>. It's the footprint of institutional money.</p>
+              <p><strong>Volume surge (>150% of average):</strong> Big players are involved. If price is going up on high volume, that's confirmation.</p>
+              <p><strong>Low volume breakout:</strong> Be cautious — it might be a fake move.</p>
+              <p>StockCards flags "Volume Surge" when today's volume is 50%+ above the 20-day average.</p>` },
+            { id: 'flag-patterns', title: 'Flag Patterns — The Bread & Butter', xp: 100,
+              content: `<p>A flag pattern is the core of our strategy. It has two parts:</p>
+              <p><strong>The Pole:</strong> A sharp price move up (14%+ in ~35 days). This shows momentum.</p>
+              <p><strong>The Flag:</strong> A tight consolidation (5-20 days, <20% range). Price is resting before the next push.</p>
+              <p><strong>The Breakout:</strong> Price breaks above the flag with volume. This is where you enter.</p>
+              <p>Think of it like a slingshot — the tighter the pullback, the more explosive the next move.</p>` }
+        ]
+    },
+    {
+        id: 'strategy', title: 'The StockCards Strategy', lessons: [
+            { id: 'entry-rules', title: 'Entry Rules — When to Buy', xp: 75,
+              content: `<p>Only enter when ALL of these are true:</p>
+              <p>✅ <strong>Uptrend:</strong> Price > 20-day SMA > 50-day SMA</p>
+              <p>✅ <strong>Near ATH:</strong> Within 20% of all-time high</p>
+              <p>✅ <strong>Flag pattern:</strong> Tight consolidation after sharp move</p>
+              <p>✅ <strong>RSI < 65:</strong> Not overbought</p>
+              <p>✅ <strong>RS ≥ 1.0:</strong> Beating the S&P 500</p>
+              <p>The more criteria met, the higher the confidence score on the card.</p>` },
+            { id: 'stop-loss', title: 'Stop Loss — Protecting Your Capital', xp: 75,
+              content: `<p>Every trade MUST have a stop loss. No exceptions.</p>
+              <p><strong>Where to place it:</strong> 1% below the flag's lowest point (swing low).</p>
+              <p><strong>Why not round numbers:</strong> Algorithms target obvious levels like $100, $50, etc. Place your stop at $99.47 instead of $100.</p>
+              <p><strong>Position sizing formula:</strong><br>
+              Shares = Max Risk $ ÷ (Entry Price - Stop Price)<br>
+              Example: $200 risk ÷ ($150 - $142) = 25 shares</p>` },
+            { id: 'exit-rules', title: 'Exit Rules — When to Sell', xp: 75,
+              content: `<p><strong>Rule #1:</strong> Exit on the first lower high. If price makes a high, pulls back, then fails to make a higher high — sell.</p>
+              <p><strong>Rule #2:</strong> Use a trailing stop (10%). As price goes up, your stop follows.</p>
+              <p><strong>Rule #3:</strong> Take partial profits at 15-20% gain. Let the rest ride with a tighter trail.</p>
+              <p>The goal is to let winners run and cut losers fast. A 3:1 reward-to-risk ratio means you can be wrong 60% of the time and still be profitable.</p>` },
+            { id: 'risk-management', title: 'Risk Management — The Real Edge', xp: 100,
+              content: `<p>Your edge isn't in picking stocks. It's in managing risk.</p>
+              <p><strong>2% Rule:</strong> Never risk more than 2% of your portfolio on a single trade.</p>
+              <p><strong>Concentration:</strong> Small accounts (under $25k) benefit from 3-5 focused positions rather than 20 diluted ones.</p>
+              <p><strong>Market mood matters:</strong> When fear/greed is in "Extreme Greed" (>75), tighten stops. When in "Extreme Fear" (<25), that's where the best setups form.</p>
+              <p>The best traders aren't right more often — they just lose small and win big.</p>` }
+        ]
+    },
+    {
+        id: 'canadian', title: 'Canadian Investing', lessons: [
+            { id: 'tfsa-rrsp', title: 'TFSA vs RRSP', xp: 50,
+              content: `<p><strong>TFSA (Tax-Free Savings Account):</strong> All gains are 100% tax-free. Best for trading if you have room.</p>
+              <p><strong>RRSP:</strong> Tax-deferred. Good for long-term retirement, but gains are taxed on withdrawal.</p>
+              <p><strong>For active trading:</strong> TFSA is your best friend. Grow $7,000/year contribution room into serious money — all tax-free.</p>
+              <p>Heads up: CRA watches for "day trading" in TFSAs. Swing trading (holding 1-4 weeks) is generally fine.</p>` },
+            { id: 'brokers-canada', title: 'Best Canadian Brokers', xp: 75,
+              content: `<p><strong>Interactive Brokers (IBKR):</strong> Best for active traders. Low commissions, real-time data, US market access. StockCards integrates with IBKR.</p>
+              <p><strong>Questrade:</strong> Good balance of features and simplicity. Free ETF purchases.</p>
+              <p><strong>Wealthsimple Trade:</strong> $0 commission on Canadian stocks. Limited US access.</p>
+              <p><strong>For StockCards users:</strong> IBKR is recommended for the best experience and lowest costs on US stocks.</p>` },
+            { id: 'taxes-canada', title: 'Taxes on Trading Gains', xp: 50,
+              content: `<p><strong>In a TFSA:</strong> $0 tax. That's the whole point.</p>
+              <p><strong>In a non-registered account:</strong> 50% of capital gains are taxable at your marginal rate.</p>
+              <p><strong>Example:</strong> You make $10,000 profit. $5,000 is taxable. If your tax rate is 30%, you pay $1,500.</p>
+              <p><strong>Track everything:</strong> Your broker provides T5008 slips. Keep records of buy/sell prices.</p>
+              <p>Losses can offset gains — so a losing trade isn't all bad from a tax perspective.</p>` },
+            { id: 'usd-cad', title: 'USD/CAD — Currency Matters', xp: 50,
+              content: `<p>Most StockCards signals are US stocks. When you buy US stocks with CAD, currency conversion eats into returns.</p>
+              <p><strong>Norbert's Gambit:</strong> A trick to convert CAD to USD cheaply. Buy DLR.TO, journal to DLR.U.TO, sell for USD. Saves 1-2% vs bank conversion.</p>
+              <p><strong>Or hold USD:</strong> IBKR lets you hold USD directly. Convert in bulk when the rate is favorable.</p>
+              <p>When CAD is strong (low USD/CAD), it's a good time to convert and buy US stocks.</p>` }
+        ]
+    }
+];
+
+function loadLearnContent() {
+    const container = document.getElementById('levels-container');
+    const progress = getLearnProgress();
+
+    container.innerHTML = LEARN_DATA.map(level => {
+        const completed = level.lessons.filter(l => progress[l.id]).length;
+        const total = level.lessons.length;
+        const pct = Math.round((completed / total) * 100);
+
+        return `
+        <div class="level-card">
+            <div class="level-header" onclick="this.parentElement.classList.toggle('expanded')">
+                <span class="level-title">${level.title}</span>
+                <span class="level-progress">${completed}/${total}</span>
+            </div>
+            <div class="level-progress-bar"><div class="level-progress-fill" style="width:${pct}%"></div></div>
+            <div class="lessons-list">
+                ${level.lessons.map(l => `
+                    <div class="lesson-item ${progress[l.id] ? 'completed' : ''}" onclick="openLesson('${l.id}')">
+                        <div><span class="lesson-title-text">${l.title}</span><span class="lesson-xp"> · ${l.xp} XP</span></div>
+                        <span class="lesson-check">${progress[l.id] ? '✓' : '→'}</span>
+                    </div>
+                `).join('')}
+            </div>
+        </div>`;
+    }).join('');
+}
+
+function openLesson(lessonId) {
+    let lesson = null;
+    for (const level of LEARN_DATA) {
+        lesson = level.lessons.find(l => l.id === lessonId);
+        if (lesson) break;
+    }
+    if (!lesson) return;
+
+    const progress = getLearnProgress();
+    const completed = progress[lessonId];
+
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay active';
+    overlay.style.zIndex = '250';
+    overlay.onclick = e => { if (e.target === overlay) overlay.remove(); };
+
+    overlay.innerHTML = `
+        <div class="modal-card select" onclick="event.stopPropagation()" style="max-width:600px;padding:32px">
+            <div class="modal-inner" style="max-height:80vh">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
+                    <h2 style="font-family:var(--font-display);font-size:1.5rem;letter-spacing:1px">${lesson.title}</h2>
+                    <button class="close-btn" onclick="this.closest('.modal-overlay').remove()">&times;</button>
+                </div>
+                <div style="font-size:0.9rem;line-height:1.7;color:var(--text-muted);margin-bottom:24px">${lesson.content}</div>
+                ${completed
+                    ? '<div style="text-align:center;color:var(--green);font-weight:600">✓ Completed</div>'
+                    : `<button onclick="completeLesson('${lessonId}', ${lesson.xp})" style="width:100%;padding:12px;border-radius:10px;background:var(--green);color:#000;font-weight:700;font-size:0.9rem">Mark Complete (+${lesson.xp} XP)</button>`
+                }
+            </div>
+        </div>`;
+
+    document.body.appendChild(overlay);
+}
+
+function completeLesson(lessonId, xp) {
+    const progress = getLearnProgress();
+    if (progress[lessonId]) return;
+    progress[lessonId] = true;
+    localStorage.setItem('sc_learn', JSON.stringify(progress));
+
+    const totalXP = parseInt(localStorage.getItem('sc_xp') || '0') + xp;
+    localStorage.setItem('sc_xp', totalXP.toString());
+    updateXP();
+
+    document.querySelector('.modal-overlay[style*="z-index: 250"]')?.remove();
+    loadLearnContent();
+}
+
+function getLearnProgress() {
+    try { return JSON.parse(localStorage.getItem('sc_learn') || '{}'); } catch { return {}; }
+}
+
+function updateXP() {
+    const xp = localStorage.getItem('sc_xp') || '0';
+    const el = document.getElementById('xp-display');
+    if (el) el.textContent = `${xp} XP`;
+}
+
+// ── HELPERS ───────────────────────────────────────────────
+
+function getTier(confidence) {
+    if (confidence >= 80) return 'prime';
+    if (confidence >= 65) return 'select';
+    if (confidence >= 40) return 'standard';
+    return 'pass';
+}
+
+function tierLabel(tier) {
+    return { prime: 'Prime', select: 'Select', standard: 'Standard', pass: 'Pass' }[tier] || 'Standard';
+}
+
+function getSignalStyle(signal) {
+    const map = {
+        BREAKOUT: { cls: 'breakout', label: 'Breakout' },
+        BUY:      { cls: 'consolidating', label: 'Consolidating' },
+        READY:    { cls: 'ready', label: 'Ready' },
+        WATCH:    { cls: 'watch', label: 'Watch' },
+        WAIT:     { cls: 'wait', label: 'Wait' },
+        AVOID:    { cls: 'avoid', label: 'Avoid' }
+    };
+    return map[signal] || map.WAIT;
+}
+
+function num(val, dec = 2) { return (val || 0).toFixed(dec); }
+function esc(str) { const d = document.createElement('div'); d.textContent = str || ''; return d.innerHTML; }
+function hide(id) { document.getElementById(id)?.classList.add('hidden'); }
+function setText(id, val) { const el = document.getElementById(id); if (el) el.textContent = val; }
+function setColor(id, cls) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.classList.remove('positive', 'negative', 'warning');
+    if (cls) el.classList.add(cls);
+}
